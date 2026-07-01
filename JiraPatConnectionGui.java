@@ -18,6 +18,8 @@ public class JiraPatConnectionGui extends JFrame {
     private JCheckBox showTokenCheck;
     private JCheckBox bypassSslCheck;
     private JCheckBox useWindowsKeyStoreCheck;
+    private JComboBox<CertItem> certComboBox;
+    private JButton refreshCertButton;
     private JSpinner connTimeoutSpinner;
     private JSpinner readTimeoutSpinner;
     private JButton testButton;
@@ -29,7 +31,7 @@ public class JiraPatConnectionGui extends JFrame {
     public JiraPatConnectionGui() {
         super("Jira PAT Connection Tester");
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-        setSize(780, 650);
+        setSize(780, 680);
         setLocationRelativeTo(null);
 
         // Try to apply native look and feel
@@ -39,6 +41,7 @@ public class JiraPatConnectionGui extends JFrame {
         }
 
         initComponents();
+        refreshCertificates(); // Initial setup of cert combobox state
     }
 
     private void initComponents() {
@@ -91,19 +94,50 @@ public class JiraPatConnectionGui extends JFrame {
         gbc.weightx = 0.0;
         configPanel.add(showTokenCheck, gbc);
 
-        // Bypass SSL
+        // Bypass SSL Checkbox
         gbc.gridx = 0;
         gbc.gridy = 2;
         gbc.gridwidth = 3;
         bypassSslCheck = new JCheckBox("Bypass Server SSL Certificate Validation (Insecure - trusts any cert)", true);
         configPanel.add(bypassSslCheck, gbc);
 
-        // Windows Certificate Store (CAC)
+        // Windows Certificate Store Checkbox
         gbc.gridx = 0;
         gbc.gridy = 3;
         gbc.gridwidth = 3;
         useWindowsKeyStoreCheck = new JCheckBox("Use Windows Certificate Store (Windows-MY for CAC / Client Cert Mutual TLS Auth)", false);
+        useWindowsKeyStoreCheck.addActionListener(e -> refreshCertificates());
         configPanel.add(useWindowsKeyStoreCheck, gbc);
+
+        // Certificate Selector Panel
+        JPanel certPanel = new JPanel(new GridBagLayout());
+        GridBagConstraints certGbc = new GridBagConstraints();
+        certGbc.fill = GridBagConstraints.HORIZONTAL;
+        certGbc.insets = new Insets(0, 0, 0, 6);
+
+        certGbc.gridx = 0;
+        certGbc.gridy = 0;
+        certGbc.weightx = 0.0;
+        certPanel.add(new JLabel("Select Certificate:"), certGbc);
+
+        certComboBox = new JComboBox<>();
+        certGbc.gridx = 1;
+        certGbc.gridy = 0;
+        certGbc.weightx = 1.0;
+        certPanel.add(certComboBox, certGbc);
+
+        refreshCertButton = new JButton("Refresh");
+        refreshCertButton.addActionListener(e -> refreshCertificates());
+        certGbc.gridx = 2;
+        certGbc.gridy = 0;
+        certGbc.weightx = 0.0;
+        certGbc.insets = new Insets(0, 0, 0, 0);
+        certPanel.add(refreshCertButton, certGbc);
+
+        gbc.gridx = 0;
+        gbc.gridy = 4;
+        gbc.gridwidth = 3;
+        configPanel.add(certPanel, gbc);
 
         // Timeouts Panel
         JPanel timeoutsPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
@@ -116,7 +150,7 @@ public class JiraPatConnectionGui extends JFrame {
         timeoutsPanel.add(readTimeoutSpinner);
 
         gbc.gridx = 0;
-        gbc.gridy = 4;
+        gbc.gridy = 5;
         gbc.gridwidth = 3;
         configPanel.add(timeoutsPanel, gbc);
 
@@ -161,6 +195,66 @@ public class JiraPatConnectionGui extends JFrame {
         add(mainPanel);
     }
 
+    private void refreshCertificates() {
+        certComboBox.removeAllItems();
+        if (!useWindowsKeyStoreCheck.isSelected()) {
+            certComboBox.setEnabled(false);
+            refreshCertButton.setEnabled(false);
+            certComboBox.addItem(new CertItem(null, "Windows Certificate Store disabled"));
+            return;
+        }
+
+        try {
+            KeyStore keyStore = KeyStore.getInstance("Windows-MY");
+            keyStore.load(null, null);
+
+            java.util.List<CertItem> items = new java.util.ArrayList<>();
+            java.util.Enumeration<String> aliases = keyStore.aliases();
+            while (aliases.hasMoreElements()) {
+                String alias = aliases.nextElement();
+                if (keyStore.isKeyEntry(alias)) {
+                    java.security.cert.Certificate cert = keyStore.getCertificate(alias);
+                    String label = alias;
+                    if (cert instanceof X509Certificate) {
+                        X509Certificate x509 = (X509Certificate) cert;
+                        String subject = x509.getSubjectX500Principal().getName();
+                        label = extractCN(subject) + " [Alias: " + alias + "]";
+                    }
+                    items.add(new CertItem(alias, label));
+                }
+            }
+
+            if (items.isEmpty()) {
+                certComboBox.addItem(new CertItem(null, "No certificates found in Windows-MY store"));
+                certComboBox.setEnabled(false);
+            } else {
+                for (CertItem item : items) {
+                    certComboBox.addItem(item);
+                }
+                certComboBox.setEnabled(true);
+            }
+            refreshCertButton.setEnabled(true);
+
+        } catch (Exception e) {
+            certComboBox.addItem(new CertItem(null, "Error loading: " + e.getMessage()));
+            certComboBox.setEnabled(false);
+            refreshCertButton.setEnabled(true);
+        }
+    }
+
+    private String extractCN(String dn) {
+        try {
+            for (String part : dn.split(",")) {
+                part = part.trim();
+                if (part.startsWith("CN=")) {
+                    return part.substring(3);
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return dn;
+    }
+
     private void performConnectionTest() {
         String targetUrl = urlField.getText().trim();
         char[] tokenChars = tokenField.getPassword();
@@ -169,6 +263,15 @@ public class JiraPatConnectionGui extends JFrame {
         boolean useWindowsKeyStore = useWindowsKeyStoreCheck.isSelected();
         int connectTimeout = (int) connTimeoutSpinner.getValue() * 1000;
         int readTimeout = (int) readTimeoutSpinner.getValue() * 1000;
+
+        CertItem selectedCert = null;
+        if (useWindowsKeyStore) {
+            Object selectedItem = certComboBox.getSelectedItem();
+            if (selectedItem instanceof CertItem) {
+                selectedCert = (CertItem) selectedItem;
+            }
+        }
+        final String selectedAlias = (selectedCert != null) ? selectedCert.alias : null;
 
         if (targetUrl.isEmpty()) {
             JOptionPane.showMessageDialog(this, "Please enter a target URL.", "Input Error", JOptionPane.ERROR_MESSAGE);
@@ -204,6 +307,9 @@ public class JiraPatConnectionGui extends JFrame {
                 publish("Target URL: " + targetUrl);
                 publish("Bypass SSL: " + bypassSsl);
                 publish("Use Windows Certificate Store: " + useWindowsKeyStore);
+                if (useWindowsKeyStore) {
+                    publish("Target Certificate Alias: " + (selectedAlias != null ? selectedAlias : "<Default / Not Selected>"));
+                }
                 publish("Connect Timeout: " + (connectTimeout / 1000) + "s");
                 publish("Read Timeout: " + (readTimeout / 1000) + "s");
                 publish("--------------------------------------------");
@@ -226,17 +332,20 @@ public class JiraPatConnectionGui extends JFrame {
                                 KeyStore keyStore = KeyStore.getInstance("Windows-MY");
                                 keyStore.load(null, null);
 
-                                int certCount = 0;
-                                java.util.Enumeration<String> aliases = keyStore.aliases();
-                                while (aliases.hasMoreElements()) {
-                                    aliases.nextElement();
-                                    certCount++;
-                                }
-                                publish("Successfully loaded Windows Certificate Store. Found " + certCount + " certificate aliases.");
-
                                 KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
                                 kmf.init(keyStore, null);
                                 keyManagers = kmf.getKeyManagers();
+
+                                if (selectedAlias != null) {
+                                    publish("Wrapping KeyManagers to enforce use of selected certificate alias: " + selectedAlias);
+                                    for (int i = 0; i < keyManagers.length; i++) {
+                                        if (keyManagers[i] instanceof X509KeyManager) {
+                                            keyManagers[i] = new SelectedAliasKeyManager((X509KeyManager) keyManagers[i], selectedAlias);
+                                        }
+                                    }
+                                } else {
+                                    publish("No certificate alias specified. Relying on default JVM KeyManager selection.");
+                                }
                                 publish("KeyManagers loaded successfully.");
                             } catch (Exception e) {
                                 publish("Warning: Failed to load Windows-MY keystore: " + e.getMessage());
@@ -372,6 +481,12 @@ public class JiraPatConnectionGui extends JFrame {
         showTokenCheck.setEnabled(enabled);
         bypassSslCheck.setEnabled(enabled);
         useWindowsKeyStoreCheck.setEnabled(enabled);
+        if (enabled) {
+            refreshCertificates(); // Restores correct enabled/disabled state of combobox & refresh button
+        } else {
+            certComboBox.setEnabled(false);
+            refreshCertButton.setEnabled(false);
+        }
         connTimeoutSpinner.setEnabled(enabled);
         readTimeoutSpinner.setEnabled(enabled);
         testButton.setEnabled(enabled);
@@ -383,6 +498,63 @@ public class JiraPatConnectionGui extends JFrame {
         java.io.PrintWriter pw = new java.io.PrintWriter(sw);
         throwable.printStackTrace(pw);
         return sw.toString();
+    }
+
+    // Friendly item class to display in JComboBox
+    public static class CertItem {
+        final String alias;
+        final String label;
+
+        public CertItem(String alias, String label) {
+            this.alias = alias;
+            this.label = label;
+        }
+
+        @Override
+        public String toString() {
+            return label;
+        }
+    }
+
+    // Custom KeyManager to enforce using the selected certificate alias during mutual SSL/TLS handshake
+    private static class SelectedAliasKeyManager implements X509KeyManager {
+        private final X509KeyManager delegate;
+        private final String selectedAlias;
+
+        SelectedAliasKeyManager(X509KeyManager delegate, String selectedAlias) {
+            this.delegate = delegate;
+            this.selectedAlias = selectedAlias;
+        }
+
+        @Override
+        public String chooseClientAlias(String[] keyType, java.security.Principal[] issuers, java.net.Socket socket) {
+            return selectedAlias;
+        }
+
+        @Override
+        public String[] getClientAliases(String keyType, java.security.Principal[] issuers) {
+            return new String[]{selectedAlias};
+        }
+
+        @Override
+        public String[] getServerAliases(String keyType, java.security.Principal[] issuers) {
+            return delegate.getServerAliases(keyType, issuers);
+        }
+
+        @Override
+        public String chooseServerAlias(String keyType, java.security.Principal[] issuers, java.net.Socket socket) {
+            return delegate.chooseServerAlias(keyType, issuers, socket);
+        }
+
+        @Override
+        public X509Certificate[] getCertificateChain(String alias) {
+            return delegate.getCertificateChain(alias);
+        }
+
+        @Override
+        public java.security.PrivateKey getPrivateKey(String alias) {
+            return delegate.getPrivateKey(alias);
+        }
     }
 
     private static class ConnectionResult {
