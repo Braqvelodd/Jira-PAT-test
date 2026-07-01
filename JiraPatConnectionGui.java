@@ -4,6 +4,7 @@ import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.security.KeyStore;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
 import javax.net.ssl.*;
@@ -16,6 +17,7 @@ public class JiraPatConnectionGui extends JFrame {
     private JPasswordField tokenField;
     private JCheckBox showTokenCheck;
     private JCheckBox bypassSslCheck;
+    private JCheckBox useWindowsKeyStoreCheck;
     private JSpinner connTimeoutSpinner;
     private JSpinner readTimeoutSpinner;
     private JButton testButton;
@@ -27,7 +29,7 @@ public class JiraPatConnectionGui extends JFrame {
     public JiraPatConnectionGui() {
         super("Jira PAT Connection Tester");
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-        setSize(750, 600);
+        setSize(780, 650);
         setLocationRelativeTo(null);
 
         // Try to apply native look and feel
@@ -93,8 +95,15 @@ public class JiraPatConnectionGui extends JFrame {
         gbc.gridx = 0;
         gbc.gridy = 2;
         gbc.gridwidth = 3;
-        bypassSslCheck = new JCheckBox("Bypass SSL / SSL Certificate Validation (Insecure)", true);
+        bypassSslCheck = new JCheckBox("Bypass Server SSL Certificate Validation (Insecure - trusts any cert)", true);
         configPanel.add(bypassSslCheck, gbc);
+
+        // Windows Certificate Store (CAC)
+        gbc.gridx = 0;
+        gbc.gridy = 3;
+        gbc.gridwidth = 3;
+        useWindowsKeyStoreCheck = new JCheckBox("Use Windows Certificate Store (Windows-MY for CAC / Client Cert Mutual TLS Auth)", false);
+        configPanel.add(useWindowsKeyStoreCheck, gbc);
 
         // Timeouts Panel
         JPanel timeoutsPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
@@ -107,7 +116,7 @@ public class JiraPatConnectionGui extends JFrame {
         timeoutsPanel.add(readTimeoutSpinner);
 
         gbc.gridx = 0;
-        gbc.gridy = 3;
+        gbc.gridy = 4;
         gbc.gridwidth = 3;
         configPanel.add(timeoutsPanel, gbc);
 
@@ -157,6 +166,7 @@ public class JiraPatConnectionGui extends JFrame {
         char[] tokenChars = tokenField.getPassword();
         String patToken = new String(tokenChars).trim();
         boolean bypassSsl = bypassSslCheck.isSelected();
+        boolean useWindowsKeyStore = useWindowsKeyStoreCheck.isSelected();
         int connectTimeout = (int) connTimeoutSpinner.getValue() * 1000;
         int readTimeout = (int) readTimeoutSpinner.getValue() * 1000;
 
@@ -175,8 +185,25 @@ public class JiraPatConnectionGui extends JFrame {
         SwingWorker<ConnectionResult, String> worker = new SwingWorker<ConnectionResult, String>() {
             @Override
             protected ConnectionResult doInBackground() {
+                // 1. Diagnostics Logging
+                publish("=== System Diagnostics ===");
+                publish("Java Version: " + System.getProperty("java.version") + " (" + System.getProperty("java.vendor") + ")");
+                publish("Java VM:      " + System.getProperty("java.vm.name"));
+                publish("OS Platform:  " + System.getProperty("os.name") + " (version: " + System.getProperty("os.version") + ")");
+                try {
+                    SSLContext context = SSLContext.getInstance("TLS");
+                    context.init(null, null, null);
+                    String[] defaultProtocols = context.getDefaultSSLParameters().getProtocols();
+                    String[] supportedProtocols = context.getSupportedSSLParameters().getProtocols();
+                    publish("Default TLS Protocols:   " + String.join(", ", defaultProtocols));
+                    publish("Supported TLS Protocols: " + String.join(", ", supportedProtocols));
+                } catch (Exception e) {
+                    publish("Diagnostics Error: Failed to query JVM TLS capabilities: " + e.getMessage());
+                }
+                publish("============================================");
                 publish("Target URL: " + targetUrl);
                 publish("Bypass SSL: " + bypassSsl);
+                publish("Use Windows Certificate Store: " + useWindowsKeyStore);
                 publish("Connect Timeout: " + (connectTimeout / 1000) + "s");
                 publish("Read Timeout: " + (readTimeout / 1000) + "s");
                 publish("--------------------------------------------");
@@ -187,29 +214,62 @@ public class JiraPatConnectionGui extends JFrame {
                     URL url = new URL(targetUrl);
                     connection = (HttpURLConnection) url.openConnection();
 
-                    // SSL setup if it's HTTPS and user checked bypass SSL
-                    if (connection instanceof HttpsURLConnection && bypassSsl) {
-                        publish("Configuring connection to bypass SSL validation...");
-                        
-                        // 1. Create a TrustManager that accepts all certificates
-                        TrustManager[] trustAllCerts = new TrustManager[]{
-                            new X509TrustManager() {
-                                public X509Certificate[] getAcceptedIssuers() { return null; }
-                                public void checkClientTrusted(X509Certificate[] certs, String authType) { }
-                                public void checkServerTrusted(X509Certificate[] certs, String authType) { }
+                    // SSL Setup
+                    if (connection instanceof HttpsURLConnection) {
+                        KeyManager[] keyManagers = null;
+                        TrustManager[] trustAllCerts = null;
+
+                        // Set up Client KeyManagers using Windows Certificate Store if checked
+                        if (useWindowsKeyStore) {
+                            publish("Attempting to load Windows Certificate Store (Windows-MY)...");
+                            try {
+                                KeyStore keyStore = KeyStore.getInstance("Windows-MY");
+                                keyStore.load(null, null);
+
+                                int certCount = 0;
+                                java.util.Enumeration<String> aliases = keyStore.aliases();
+                                while (aliases.hasMoreElements()) {
+                                    aliases.nextElement();
+                                    certCount++;
+                                }
+                                publish("Successfully loaded Windows Certificate Store. Found " + certCount + " certificate aliases.");
+
+                                KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+                                kmf.init(keyStore, null);
+                                keyManagers = kmf.getKeyManagers();
+                                publish("KeyManagers loaded successfully.");
+                            } catch (Exception e) {
+                                publish("Warning: Failed to load Windows-MY keystore: " + e.getMessage());
+                                publish("Proceeding without Windows client certificates.");
                             }
-                        };
+                        }
 
-                        // 2. Initialize SSLContext
-                        SSLContext insecureSslContext = SSLContext.getInstance("TLS");
-                        insecureSslContext.init(null, trustAllCerts, new SecureRandom());
+                        // Set up trust-all TrustManagers if checked
+                        if (bypassSsl) {
+                            publish("Configuring TrustManager to bypass server certificate validation (Insecure)...");
+                            trustAllCerts = new TrustManager[]{
+                                new X509TrustManager() {
+                                    public X509Certificate[] getAcceptedIssuers() { return null; }
+                                    public void checkClientTrusted(X509Certificate[] certs, String authType) { }
+                                    public void checkServerTrusted(X509Certificate[] certs, String authType) { }
+                                }
+                            };
+                        }
 
-                        HttpsURLConnection httpsConnection = (HttpsURLConnection) connection;
-                        httpsConnection.setSSLSocketFactory(insecureSslContext.getSocketFactory());
+                        // Apply SSL Socket Factory
+                        if (useWindowsKeyStore || bypassSsl) {
+                            publish("Initializing custom SSLContext (TLS)...");
+                            SSLContext sslContext = SSLContext.getInstance("TLS");
+                            sslContext.init(keyManagers, trustAllCerts, new SecureRandom());
 
-                        // 3. Create HostnameVerifier to bypass mismatches
-                        HostnameVerifier allHostsValid = (hostname, session) -> true;
-                        httpsConnection.setHostnameVerifier(allHostsValid);
+                            HttpsURLConnection httpsConnection = (HttpsURLConnection) connection;
+                            httpsConnection.setSSLSocketFactory(sslContext.getSocketFactory());
+
+                            if (bypassSsl) {
+                                HostnameVerifier allHostsValid = (hostname, session) -> true;
+                                httpsConnection.setHostnameVerifier(allHostsValid);
+                            }
+                        }
                     }
 
                     connection.setRequestMethod("GET");
@@ -295,7 +355,7 @@ public class JiraPatConnectionGui extends JFrame {
                     }
                 } catch (Exception e) {
                     logArea.append("\nException occurred in SwingWorker: " + e.getMessage() + "\n");
-                    statusLabel.setText("Error occurred execution.");
+                    statusLabel.setText("Error occurred during execution.");
                     statusLabel.setForeground(Color.RED);
                 } finally {
                     setUiEnabled(true);
@@ -311,6 +371,7 @@ public class JiraPatConnectionGui extends JFrame {
         tokenField.setEnabled(enabled);
         showTokenCheck.setEnabled(enabled);
         bypassSslCheck.setEnabled(enabled);
+        useWindowsKeyStoreCheck.setEnabled(enabled);
         connTimeoutSpinner.setEnabled(enabled);
         readTimeoutSpinner.setEnabled(enabled);
         testButton.setEnabled(enabled);
